@@ -61,7 +61,22 @@ class ApiGuard implements FilterInterface
             }
             $origin = $request->getHeaderLine("Origin");
             $base = rtrim(config("App")->baseURL, "/");
-            $allowed = [$base];
+            $allowed = array_values(array_filter([
+                $base,
+                "https://stack-quest.netlify.app",
+                "https://sports.techcov.in",
+            ]));
+
+            $customAllowed = env("ALLOWED_ORIGINS");
+            if ($customAllowed) {
+                $allowed = array_merge($allowed, array_map('trim', explode(',', $customAllowed)));
+            }
+
+            // Allow Netlify production & deploy preview domains
+            if ($origin && preg_match('#^https://[a-z0-9-]+(\.netlify\.app)$#i', $origin)) {
+                $allowed[] = $origin;
+            }
+
             if (ENVIRONMENT === "development") {
                 $allowed = array_merge($allowed, [
                     "http://localhost:5173",
