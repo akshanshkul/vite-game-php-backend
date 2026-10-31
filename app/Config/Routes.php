@@ -21,10 +21,15 @@ $routes->group(
         $r->get("daily/(:segment)", 'Game::daily/$1');
         $r->get("progress", "Game::progress");
         $r->post("progress/sync", "Game::sync");
+        $r->get("me/state", "Game::state");
+        $r->post("me/state/sync", "Game::stateSync");
         $r->post("runs", "Game::run");
         $r->post("runs/(:segment)/complete", 'Game::finish/$1');
         $r->get("leaderboards", "Game::leaderboards");
 $r->get("rankings", "Game::rankings");
+        $r->get("friends", "Game::friends");
+        $r->post("friends", "Game::addFriend");
+        $r->delete("friends/(:segment)", 'Game::removeFriend/$1');
         $r->get("achievements", "Game::achievements");
         $r->get("inventory", "Game::inventory");
         $r->post("rewards/claim", "Game::claim");

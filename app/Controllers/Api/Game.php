@@ -365,6 +365,143 @@ class Game extends ResourceController
                     ->getRowArray()["version"] ?? 0),
         ]);
     }
+    /** The cross-device wallet: summed ledger plus owned themes and claims. */
+    private function walletState(string $uid): array
+    {
+        $sums = [];
+        foreach (
+            $this->db()
+                ->table("wallet_events")
+                ->select("kind, SUM(delta) AS total")
+                ->where("user_id", $uid)
+                ->groupBy("kind")
+                ->get()
+                ->getResultArray()
+            as $r
+        ) {
+            $sums[$r["kind"]] = (int) $r["total"];
+        }
+        $row = $this->db()
+            ->table("player_state")
+            ->where("user_id", $uid)
+            ->get()
+            ->getRowArray();
+        return [
+            "coins" => $sums["coins"] ?? 0,
+            "undos" => $sums["undos"] ?? 0,
+            "purchases" => $row ? json_decode($row["purchases_json"], true) : [],
+            "claims" => $row ? json_decode($row["claims_json"], true) : [],
+            "version" => (int) ($row["version"] ?? 0),
+        ];
+    }
+    public function state()
+    {
+        if (!($u = $this->user())) {
+            return $this->error("AUTH_REQUIRED", "Please sign in.", 401);
+        }
+        return $this->respond($this->walletState($u["id"]));
+    }
+    /**
+     * Merge a device's wallet into the account. Coin/undo changes are ledger
+     * events (each id stored once, so retries are safe); themes and one-time
+     * claim keys are unioned, so a gift claimed on one device can't be
+     * claimed again on another.
+     */
+    public function stateSync()
+    {
+        if (!($u = $this->user())) {
+            return $this->error("AUTH_REQUIRED", "Please sign in.", 401);
+        }
+        $b = $this->body();
+        $events = $b["events"] ?? [];
+        $purchases = $b["purchases"] ?? [];
+        $claims = $b["claims"] ?? [];
+        $limits = ["coins" => 5000, "undos" => 20];
+        $key = '/^[a-z0-9:_.-]{1,64}$/';
+        if (
+            !is_array($events) ||
+            count($events) > 200 ||
+            !is_array($purchases) ||
+            count($purchases) > 64 ||
+            !is_array($claims) ||
+            count($claims) > 500
+        ) {
+            return $this->error("VALIDATION", "Too many wallet changes in one request.");
+        }
+        foreach ($events as $e) {
+            if (
+                !is_array($e) ||
+                !is_string($e["id"] ?? null) ||
+                !preg_match('/^[a-zA-Z0-9:_.-]{1,128}$/', $e["id"]) ||
+                !isset($limits[$e["kind"] ?? ""]) ||
+                !is_int($e["delta"] ?? null) ||
+                abs($e["delta"]) > $limits[$e["kind"]] ||
+                !is_string($e["reason"] ?? null) ||
+                !preg_match($key, $e["reason"])
+            ) {
+                return $this->error("VALIDATION", "Invalid wallet event.");
+            }
+        }
+        foreach (array_merge($purchases, $claims) as $k) {
+            if (!is_string($k) || !preg_match($key, $k)) {
+                return $this->error("VALIDATION", "Invalid theme or claim key.");
+            }
+        }
+        $uid = $u["id"];
+        $this->db()->transStart();
+        $this->lockWallet($uid);
+        $ack = [];
+        foreach ($events as $e) {
+            $ack[] = $e["id"];
+            $exists = $this->db()
+                ->table("wallet_events")
+                ->where(["user_id" => $uid, "client_event_id" => $e["id"]])
+                ->countAllResults();
+            if (!$exists) {
+                $this->db()
+                    ->table("wallet_events")
+                    ->insert([
+                        "id" => $this->id(),
+                        "user_id" => $uid,
+                        "client_event_id" => $e["id"],
+                        "kind" => $e["kind"],
+                        "delta" => $e["delta"],
+                        "reason" => $e["reason"],
+                        "created_at" => $this->now(),
+                    ]);
+            }
+        }
+        $row = $this->db()
+            ->table("player_state")
+            ->where("user_id", $uid)
+            ->get()
+            ->getRowArray();
+        $ownedBefore = $row ? json_decode($row["purchases_json"], true) : [];
+        $claimedBefore = $row ? json_decode($row["claims_json"], true) : [];
+        $owned = array_values(array_unique(array_merge($ownedBefore, $purchases)));
+        // Keep the most recent claim keys; old dated keys can't be reclaimed
+        // anyway because the client only claims for the current date.
+        $claimed = array_slice(
+            array_values(array_unique(array_merge($claimedBefore, $claims))),
+            -3000,
+        );
+        $data = [
+            "purchases_json" => json_encode($owned),
+            "claims_json" => json_encode($claimed),
+            "version" => (int) ($row["version"] ?? 0) + 1,
+            "updated_at" => $this->now(),
+        ];
+        if ($row) {
+            $this->db()->table("player_state")->where("user_id", $uid)->update($data);
+        } else {
+            $this->db()->table("player_state")->insert($data + ["user_id" => $uid]);
+        }
+        $this->db()->transComplete();
+        if (!$this->db()->transStatus()) {
+            return $this->error("SYNC_FAILED", "Could not save your wallet. Try again.", 409);
+        }
+        return $this->respond(["acknowledged" => $ack] + $this->walletState($uid));
+    }
     public function sync()
     {
         if (!($u = $this->user())) {
@@ -392,34 +529,89 @@ class Game extends ResourceController
                 return $this->error("VALIDATION", "Invalid completion event.");
             }
         }
+        if (!$events) {
+            return $this->respond([
+                "acknowledged" => [],
+                "items" => $this->db()
+                    ->table("player_progress")
+                    ->where("user_id", $u["id"])
+                    ->get()
+                    ->getResultArray(),
+            ]);
+        }
         $this->db()->transStart();
         $this->lockWallet($u["id"]);
+        // A few bulk reads and batched writes per request (not several
+        // queries per event): over a remote database the per-event version
+        // passed PHP's 30 s limit for players with many levels.
         $ack = [];
-        foreach ($events as $e) {
-            $duplicate = $this->db()
-                ->table("sync_events")
-                ->where(["user_id" => $u["id"], "client_event_id" => $e["id"]])
-                ->countAllResults();
-            if ($duplicate) {
-                $ack[] = $e["id"];
-                continue;
-            }
-            $p = $e["payload"];
-            $level = $this->db()
-                ->table("levels")
-                ->where(["id" => $p["puzzleId"], "status" => "published"])
-                ->get()
-                ->getRowArray();
-            if (!$level) {
-                continue;
-            }
-            $ack[] = $e["id"];
-            $old = $this->db()
+        $seen = array_flip(
+            array_column(
+                $this->db()
+                    ->table("sync_events")
+                    ->select("client_event_id")
+                    ->where("user_id", $u["id"])
+                    ->whereIn("client_event_id", array_column($events, "id"))
+                    ->get()
+                    ->getResultArray(),
+                "client_event_id",
+            ),
+        );
+        $puzzleIds = array_values(
+            array_unique(
+                array_map(fn($e) => $e["payload"]["puzzleId"], $events),
+            ),
+        );
+        $catalog = array_flip(
+            array_column(
+                $this->db()
+                    ->table("levels")
+                    ->select("id")
+                    ->whereIn("id", $puzzleIds)
+                    ->where("status", "published")
+                    ->get()
+                    ->getResultArray(),
+                "id",
+            ),
+        );
+        $progress = [];
+        foreach (
+            $this->db()
                 ->table("player_progress")
-                ->where(["user_id" => $u["id"], "level_id" => $p["puzzleId"]])
+                ->where("user_id", $u["id"])
+                ->whereIn("level_id", $puzzleIds)
                 ->get()
-                ->getRowArray();
-            $row = [
+                ->getResultArray()
+            as $r
+        ) {
+            $progress[$r["level_id"]] = $r;
+        }
+        $fresh = [];
+        $dirty = [];
+        $logs = [];
+        foreach ($events as $e) {
+            $ack[] = $e["id"];
+            if (isset($seen[$e["id"]])) {
+                continue;
+            }
+            $seen[$e["id"]] = true;
+            $p = $e["payload"];
+            // Catalogue levels, or generated endless levels (endless-101…),
+            // which have no catalogue row but are deterministic per number.
+            $endless =
+                preg_match('/^endless-(\d{3,7})$/', $p["puzzleId"], $m) &&
+                (int) $m[1] > 100;
+            if (!$endless && !isset($catalog[$p["puzzleId"]])) {
+                // Unknown level (e.g. retired content): acknowledge and drop
+                // it so the device stops resending it forever.
+                continue;
+            }
+            $old = $progress[$p["puzzleId"]] ?? null;
+            if (!$old) {
+                $fresh[$p["puzzleId"]] = true;
+            }
+            $progress[$p["puzzleId"]] = [
+                "id" => $old["id"] ?? $this->id(),
                 "user_id" => $u["id"],
                 "level_id" => $p["puzzleId"],
                 "best_score" => max(
@@ -437,32 +629,35 @@ class Game extends ResourceController
                 "version" => (int) ($old["version"] ?? 0) + 1,
                 "completed_at" => $this->now(),
             ];
-            if ($old) {
-                $this->db()
-                    ->table("player_progress")
-                    ->where("id", $old["id"])
-                    ->update($row);
+            $dirty[$p["puzzleId"]] = true;
+            $logs[] = [
+                "id" => $this->id(),
+                "user_id" => $u["id"],
+                "client_event_id" => $e["id"],
+                "event_type" => "casual-completion",
+                "payload_json" => json_encode($p),
+                "server_version" => $progress[$p["puzzleId"]]["version"],
+                "created_at" => $this->now(),
+            ];
+        }
+        $inserts = [];
+        $updates = [];
+        foreach (array_keys($dirty) as $levelId) {
+            $row = $progress[$levelId];
+            if (isset($fresh[$levelId])) {
+                $inserts[] = $row + ["created_at" => $this->now()];
             } else {
-                $this->db()
-                    ->table("player_progress")
-                    ->insert(
-                        $row + [
-                            "id" => $this->id(),
-                            "created_at" => $this->now(),
-                        ],
-                    );
+                $updates[] = $row;
             }
-            $this->db()
-                ->table("sync_events")
-                ->insert([
-                    "id" => $this->id(),
-                    "user_id" => $u["id"],
-                    "client_event_id" => $e["id"],
-                    "event_type" => "casual-completion",
-                    "payload_json" => json_encode($p),
-                    "server_version" => $row["version"],
-                    "created_at" => $this->now(),
-                ]);
+        }
+        if ($inserts) {
+            $this->db()->table("player_progress")->insertBatch($inserts);
+        }
+        if ($updates) {
+            $this->db()->table("player_progress")->updateBatch($updates, "id");
+        }
+        if ($logs) {
+            $this->db()->table("sync_events")->insertBatch($logs);
         }
         $this->db()
             ->table("wallets")
@@ -646,28 +841,271 @@ class Game extends ResourceController
         ]);
     }
     /**
-     * Player standings from synced campaign progress: levels cleared, then
-     * stars, then best scores. Only display names leave the server; the
-     * signed-in player's own row is flagged and their rank is always returned.
+     * Player standings counted the way the game unlocks levels: campaign
+     * levels cleared in an unbroken run from level 1, plus endless levels once
+     * the campaign is finished. Stray clears (e.g. from an older level set)
+     * don't count. Sorted by levels, stars, score, then name. Only display
+     * names leave the server; the signed-in player's own row is flagged.
      */
+    private function standings(): array
+    {
+        $byUser = [];
+        foreach (
+            $this->db()
+                ->table("player_progress")
+                ->select(
+                    "users.id AS uid, users.display_name, player_progress.level_id, player_progress.stars, player_progress.best_score",
+                )
+                ->join("users", "users.id=player_progress.user_id")
+                ->where("users.status", "active")
+                ->get()
+                ->getResultArray()
+            as $r
+        ) {
+            $byUser[$r["uid"]]["name"] = (string) $r["display_name"];
+            $byUser[$r["uid"]]["rows"][$r["level_id"]] = $r;
+        }
+        $out = [];
+        foreach ($byUser as $uid => $u) {
+            $rows = $u["rows"];
+            $run = 0;
+            while (
+                $run < 100 &&
+                isset($rows[sprintf("level-%03d", $run + 1)])
+            ) {
+                $run++;
+            }
+            $counted = [];
+            for ($n = 1; $n <= $run; $n++) {
+                $counted[] = $rows[sprintf("level-%03d", $n)];
+            }
+            if ($run === 100) {
+                foreach ($rows as $id => $r) {
+                    if (str_starts_with($id, "endless-")) {
+                        $counted[] = $r;
+                    }
+                }
+            }
+            if (!$counted) {
+                continue;
+            }
+            $out[] = [
+                "uid" => $uid,
+                "display_name" => $u["name"],
+                "levels" => count($counted),
+                "stars" => array_sum(array_map(fn($r) => (int) $r["stars"], $counted)),
+                "score" => array_sum(array_map(fn($r) => (int) $r["best_score"], $counted)),
+            ];
+        }
+        usort(
+            $out,
+            fn($a, $b) => [$b["levels"], $b["stars"], $b["score"], $a["display_name"]] <=>
+                [$a["levels"], $a["stars"], $a["score"], $b["display_name"]],
+        );
+        return $out;
+    }
+    /** The player's friend code, created on first use (6 easy-to-read characters). */
+    private function friendCode(string $uid): string
+    {
+        $row = $this->db()
+            ->table("friend_codes")
+            ->where("user_id", $uid)
+            ->get()
+            ->getRowArray();
+        if ($row) {
+            return $row["code"];
+        }
+        $alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+        for ($try = 0; $try < 8; $try++) {
+            $code = "";
+            for ($i = 0; $i < 6; $i++) {
+                $code .= $alphabet[random_int(0, strlen($alphabet) - 1)];
+            }
+            $taken = $this->db()
+                ->table("friend_codes")
+                ->where("code", $code)
+                ->countAllResults();
+            if (!$taken) {
+                $this->db()
+                    ->table("friend_codes")
+                    ->insert([
+                        "user_id" => $uid,
+                        "code" => $code,
+                        "created_at" => $this->now(),
+                    ]);
+                return $code;
+            }
+        }
+        throw new \RuntimeException("Could not create a friend code.");
+    }
+    /** Me plus my friends, ranked like the public board (via standings()). */
+    private function friendsBoard(array $me): array
+    {
+        $ids = array_column(
+            $this->db()
+                ->table("friendships")
+                ->select("friend_id")
+                ->where("user_id", $me["id"])
+                ->get()
+                ->getResultArray(),
+            "friend_id",
+        );
+        $people = [$me["id"] => true] + array_fill_keys($ids, true);
+        $codes = [];
+        $names = [];
+        if ($ids) {
+            foreach (
+                $this->db()
+                    ->table("users")
+                    ->select("users.id, users.display_name, friend_codes.code")
+                    ->join("friend_codes", "friend_codes.user_id=users.id", "left")
+                    ->whereIn("users.id", $ids)
+                    ->where("users.status", "active")
+                    ->get()
+                    ->getResultArray()
+                as $r
+            ) {
+                $codes[$r["id"]] = $r["code"];
+                $names[$r["id"]] = $r["display_name"];
+            }
+        }
+        $codes[$me["id"]] = $this->friendCode($me["id"]);
+        $names[$me["id"]] = $me["display_name"];
+        $board = [];
+        foreach ($this->standings() as $r) {
+            if (isset($people[$r["uid"]], $names[$r["uid"]])) {
+                $board[] = $r;
+                unset($people[$r["uid"]]);
+            }
+        }
+        // Friends who haven't synced a level yet still show, at the bottom.
+        foreach (array_keys($people) as $uid) {
+            if (isset($names[$uid])) {
+                $board[] = [
+                    "uid" => $uid,
+                    "display_name" => $names[$uid],
+                    "levels" => 0,
+                    "stars" => 0,
+                    "score" => 0,
+                ];
+            }
+        }
+        $items = [];
+        $rank = 0;
+        foreach ($board as $i => $r) {
+            if (
+                $i === 0 ||
+                [$r["levels"], $r["stars"], $r["score"]] !==
+                    [$board[$i - 1]["levels"], $board[$i - 1]["stars"], $board[$i - 1]["score"]]
+            ) {
+                $rank = $i + 1;
+            }
+            $items[] = [
+                "rank" => $rank,
+                "displayName" => (string) $r["display_name"],
+                "code" => $codes[$r["uid"]] ?? null,
+                "levels" => (int) $r["levels"],
+                "stars" => (int) $r["stars"],
+                "score" => (int) $r["score"],
+                "isMe" => $r["uid"] === $me["id"],
+            ];
+        }
+        return ["code" => $codes[$me["id"]], "items" => $items];
+    }
+    public function friends()
+    {
+        if (!($u = $this->user())) {
+            return $this->error("AUTH_REQUIRED", "Please sign in.", 401);
+        }
+        return $this->respond($this->friendsBoard($u));
+    }
+    public function addFriend()
+    {
+        if (!($u = $this->user())) {
+            return $this->error("AUTH_REQUIRED", "Please sign in.", 401);
+        }
+        if (!service("throttler")->check("friend-add-" . $u["id"], 20, 3600)) {
+            return $this->error("RATE_LIMIT", "Too many tries. Please try later.", 429);
+        }
+        $code = strtoupper(trim((string) ($this->body()["code"] ?? "")));
+        if (!preg_match('/^[A-Z2-9]{6}$/', $code)) {
+            return $this->error("VALIDATION", "Friend codes are 6 letters and numbers.");
+        }
+        $friend = $this->db()
+            ->table("friend_codes")
+            ->select("friend_codes.user_id")
+            ->join("users", "users.id=friend_codes.user_id")
+            ->where(["friend_codes.code" => $code, "users.status" => "active"])
+            ->get()
+            ->getRowArray();
+        if (!$friend) {
+            return $this->error("NOT_FOUND", "No player has that code.", 404);
+        }
+        if ($friend["user_id"] === $u["id"]) {
+            return $this->error("VALIDATION", "That's your own code.");
+        }
+        $count = $this->db()
+            ->table("friendships")
+            ->where("user_id", $u["id"])
+            ->countAllResults();
+        if ($count >= 100) {
+            return $this->error("LIMIT", "You can have up to 100 friends.");
+        }
+        $this->db()->transStart();
+        foreach (
+            [[$u["id"], $friend["user_id"]], [$friend["user_id"], $u["id"]]]
+            as [$a, $b]
+        ) {
+            $exists = $this->db()
+                ->table("friendships")
+                ->where(["user_id" => $a, "friend_id" => $b])
+                ->countAllResults();
+            if (!$exists) {
+                $this->db()
+                    ->table("friendships")
+                    ->insert([
+                        "user_id" => $a,
+                        "friend_id" => $b,
+                        "created_at" => $this->now(),
+                    ]);
+            }
+        }
+        $this->db()->transComplete();
+        return $this->respond($this->friendsBoard($u));
+    }
+    public function removeFriend(string $code)
+    {
+        if (!($u = $this->user())) {
+            return $this->error("AUTH_REQUIRED", "Please sign in.", 401);
+        }
+        if (!service("throttler")->check("friend-remove-" . $u["id"], 60, 3600)) {
+            return $this->error("RATE_LIMIT", "Too many tries. Please try later.", 429);
+        }
+        $code = strtoupper($code);
+        if (!preg_match('/^[A-Z2-9]{6}$/', $code)) {
+            return $this->error("VALIDATION", "Invalid friend code.");
+        }
+        $friend = $this->db()
+            ->table("friend_codes")
+            ->where("code", $code)
+            ->get()
+            ->getRowArray();
+        if ($friend) {
+            $this->db()
+                ->table("friendships")
+                ->groupStart()
+                ->where(["user_id" => $u["id"], "friend_id" => $friend["user_id"]])
+                ->groupEnd()
+                ->orGroupStart()
+                ->where(["user_id" => $friend["user_id"], "friend_id" => $u["id"]])
+                ->groupEnd()
+                ->delete();
+        }
+        return $this->respond($this->friendsBoard($u));
+    }
     public function rankings()
     {
-        $standings = fn() => $this->db()
-            ->table("player_progress")
-            ->select(
-                "users.id AS uid, users.display_name, COUNT(*) AS levels, SUM(player_progress.stars) AS stars, SUM(player_progress.best_score) AS score",
-            )
-            ->join("users", "users.id=player_progress.user_id")
-            ->where("users.status", "active")
-            ->groupBy("users.id, users.display_name");
-        $rows = $standings()
-            ->orderBy("levels", "DESC")
-            ->orderBy("stars", "DESC")
-            ->orderBy("score", "DESC")
-            ->orderBy("users.display_name", "ASC")
-            ->limit(50)
-            ->get()
-            ->getResultArray();
+        $all = $this->standings();
         $me = $this->user();
         $shape = fn(array $r, int $rank) => [
             "rank" => $rank,
@@ -678,42 +1116,28 @@ class Game extends ResourceController
             "isMe" => $me !== null && $r["uid"] === $me["id"],
         ];
         $items = [];
-        foreach ($rows as $i => $r) {
-            $items[] = $shape($r, $i + 1);
-        }
         $mine = null;
-        if ($me) {
-            $own = $standings()
-                ->where("users.id", $me["id"])
-                ->get()
-                ->getRowArray();
-            if ($own) {
-                // Rank = 1 + players strictly ahead on (levels, stars, score).
-                $ahead = 0;
-                foreach (
-                    $standings()->get()->getResultArray()
-                    as $r
-                ) {
-                    $better =
-                        [(int) $r["levels"], (int) $r["stars"], (int) $r["score"]] <=>
-                        [(int) $own["levels"], (int) $own["stars"], (int) $own["score"]];
-                    if ($better > 0) {
-                        $ahead++;
-                    }
-                }
-                $mine = $shape($own, $ahead + 1);
+        $rank = 0;
+        foreach ($all as $i => $r) {
+            // Equal (levels, stars, score) share a rank.
+            if (
+                $i === 0 ||
+                [$r["levels"], $r["stars"], $r["score"]] !==
+                    [$all[$i - 1]["levels"], $all[$i - 1]["stars"], $all[$i - 1]["score"]]
+            ) {
+                $rank = $i + 1;
+            }
+            if ($i < 50) {
+                $items[] = $shape($r, $rank);
+            }
+            if ($me && $r["uid"] === $me["id"]) {
+                $mine = $shape($r, $rank);
             }
         }
         return $this->respond([
             "items" => $items,
             "me" => $mine,
-            "players" => (int) ($this->db()
-                ->table("player_progress")
-                ->join("users", "users.id=player_progress.user_id")
-                ->where("users.status", "active")
-                ->select("COUNT(DISTINCT player_progress.user_id) AS n")
-                ->get()
-                ->getRowArray()["n"] ?? 0),
+            "players" => count($all),
         ]);
     }
     public function leaderboards()
